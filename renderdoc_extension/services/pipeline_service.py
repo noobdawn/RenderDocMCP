@@ -19,13 +19,13 @@ class PipelineService:
         if not self.ctx.IsCaptureLoaded():
             raise ValueError("No capture loaded")
 
+        stage_enum = Parsers.parse_stage(stage)
         result = {"shader": None, "error": None}
 
         def callback(controller):
             controller.SetFrameEvent(event_id, True)
 
             pipe = controller.GetPipelineState()
-            stage_enum = Parsers.parse_stage(stage)
 
             shader = pipe.GetShader(stage_enum)
             if shader == rd.ResourceId.Null():
@@ -34,30 +34,47 @@ class PipelineService:
 
             entry = pipe.GetShaderEntryPoint(stage_enum)
             reflection = pipe.GetShaderReflection(stage_enum)
+            if reflection is None:
+                result["error"] = "Shader reflection unavailable for %s shader" % stage
+                return
+
+            pipeline = (pipe.GetComputePipelineObject()
+                        if stage_enum == rd.ShaderStage.Compute
+                        else pipe.GetGraphicsPipelineObject())
+            debug_info = reflection.debugInfo
+            source_files = [
+                {"filename": source.filename, "contents": source.contents}
+                for source in debug_info.files
+            ]
 
             shader_info = {
                 "resource_id": str(shader),
                 "entry_point": entry,
                 "stage": stage,
+                "encoding": str(reflection.encoding),
+                "source_files": source_files,
+                "source_available": any(source["contents"] for source in source_files),
+                "source_encoding": str(debug_info.encoding),
+                "source_entry_point": debug_info.entrySourceName,
+                "source_debug_information": debug_info.sourceDebugInformation,
+                "debug_info_loading_log": getattr(debug_info, "debugInfoLoadingLog", None),
             }
 
             # Get disassembly
             try:
                 targets = controller.GetDisassemblyTargets(True)
-                if targets:
-                    disasm = controller.DisassembleShader(
-                        pipe.GetGraphicsPipelineObject(), reflection, targets[0]
-                    )
-                    shader_info["disassembly"] = disasm
+                shader_info["disassembly_target"] = targets[0] if targets else ""
+                shader_info["disassembly"] = controller.DisassembleShader(
+                    pipeline, reflection, shader_info["disassembly_target"]
+                )
             except Exception as e:
                 shader_info["disassembly_error"] = str(e)
 
             # Get constant buffer info
-            if reflection:
-                shader_info["constant_buffers"] = self._get_cbuffer_info(
-                    controller, pipe, reflection, stage_enum
-                )
-                shader_info["resources"] = self._get_resource_bindings(reflection)
+            shader_info["constant_buffers"] = self._get_cbuffer_info(
+                controller, pipe, reflection, stage_enum
+            )
+            shader_info["resources"] = self._get_resource_bindings(reflection)
 
             result["shader"] = shader_info
 
@@ -380,7 +397,9 @@ class PipelineService:
                 bind = pipe.GetConstantBuffer(stage, i, 0)
                 if bind.resourceId != rd.ResourceId.Null():
                     variables = controller.GetCBufferVariableContents(
-                        pipe.GetGraphicsPipelineObject(),
+                        (pipe.GetComputePipelineObject()
+                         if stage == rd.ShaderStage.Compute
+                         else pipe.GetGraphicsPipelineObject()),
                         reflection.resourceId,
                         stage,
                         reflection.entryPoint,
