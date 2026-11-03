@@ -6,16 +6,18 @@ Communicates with the RenderDoc extension via file-based IPC.
 import json
 import os
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any
 
 
 # IPC directory (must match renderdoc_extension/socket_server.py)
-IPC_DIR = os.path.join(tempfile.gettempdir(), "renderdoc_mcp")
+IPC_DIR = os.environ.get("RENDERDOC_MCP_IPC_DIR", os.path.join(tempfile.gettempdir(), "renderdoc_mcp"))
 REQUEST_FILE = os.path.join(IPC_DIR, "request.json")
 RESPONSE_FILE = os.path.join(IPC_DIR, "response.json")
 LOCK_FILE = os.path.join(IPC_DIR, "lock")
+_CALL_LOCK = threading.Lock()
 
 
 class RenderDocBridgeError(Exception):
@@ -35,6 +37,10 @@ class RenderDocBridge:
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
         """Call a method on the RenderDoc extension"""
+        with _CALL_LOCK:
+            return self._call(method, params)
+
+    def _call(self, method: str, params: dict[str, Any] | None = None) -> Any:
         # Check if IPC directory exists
         if not os.path.exists(IPC_DIR):
             raise RenderDocBridgeError(
@@ -48,6 +54,7 @@ class RenderDocBridge:
             "params": params or {},
         }
 
+        timeout = 300.0 if method in ("export_texture_2d", "export_texture_3d_atlas") else self.timeout
         try:
             # Clean up any stale response file
             if os.path.exists(RESPONSE_FILE):
@@ -78,6 +85,11 @@ class RenderDocBridge:
                     # Clean up response file
                     os.remove(RESPONSE_FILE)
 
+                    if response.get("id") != request["id"]:
+                        if time.time() - start_time > timeout:
+                            raise RenderDocBridgeError("Request timed out")
+                        continue
+
                     if "error" in response:
                         error = response["error"]
                         raise RenderDocBridgeError(f"[{error['code']}] {error['message']}")
@@ -85,7 +97,7 @@ class RenderDocBridge:
                     return response.get("result")
 
                 # Check timeout
-                if time.time() - start_time > self.timeout:
+                if time.time() - start_time > timeout:
                     raise RenderDocBridgeError("Request timed out")
 
                 # Poll interval

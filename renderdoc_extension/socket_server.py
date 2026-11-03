@@ -12,7 +12,7 @@ from PySide2.QtCore import QObject, QTimer
 
 
 # IPC directory
-IPC_DIR = os.path.join(tempfile.gettempdir(), "renderdoc_mcp")
+IPC_DIR = os.environ.get("RENDERDOC_MCP_IPC_DIR", os.path.join(tempfile.gettempdir(), "renderdoc_mcp"))
 REQUEST_FILE = os.path.join(IPC_DIR, "request.json")
 RESPONSE_FILE = os.path.join(IPC_DIR, "response.json")
 LOCK_FILE = os.path.join(IPC_DIR, "lock")
@@ -62,7 +62,7 @@ class MCPBridgeServer(QObject):
 
     def _cleanup_files(self):
         """Remove IPC files"""
-        for f in [REQUEST_FILE, RESPONSE_FILE, LOCK_FILE]:
+        for f in [REQUEST_FILE, RESPONSE_FILE, RESPONSE_FILE + ".tmp", LOCK_FILE]:
             try:
                 if os.path.exists(f):
                     os.remove(f)
@@ -101,8 +101,10 @@ class MCPBridgeServer(QObject):
                 }
 
             # Write response
-            with open(RESPONSE_FILE, "w", encoding="utf-8") as f:
+            temp_response = RESPONSE_FILE + ".tmp"
+            with open(temp_response, "w", encoding="utf-8") as f:
                 json.dump(response, f)
+            os.replace(temp_response, RESPONSE_FILE)
 
         except Exception as e:
             print("[MCP Bridge] Error processing request: %s" % str(e))
