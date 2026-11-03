@@ -191,9 +191,129 @@ def get_shader_info(
         event_id: The event ID to inspect the shader at
         stage: The shader stage (vertex, hull, domain, geometry, pixel, compute)
 
-    Returns shader disassembly, constant buffer values, and resource bindings.
+    Returns native shader disassembly, source files from shader debug information,
+    debug loading diagnostics, constant buffer values, and resource bindings.
+    For external shader debug files, configure RenderDoc's Settings > Core >
+    Shader Debug Search Path and reload shader debug information or reopen the capture.
+    Source may be unavailable if matching debug information is missing or stripped.
     """
     return bridge.call("get_shader_info", {"event_id": event_id, "stage": stage})
+
+
+@mcp.tool
+def debug_vertex(
+    event_id: int,
+    vertex: int,
+    instance: int = 0,
+    view: int = 0,
+) -> dict:
+    """
+    Start debugging a vertex shader invocation and return a trace identifier.
+
+    Args:
+        event_id: Action event ID that issued the draw call to debug (not a
+                  resource ID). Use get_draw_calls to find it.
+        vertex: Zero-based vertex index within the draw call's vertex/index
+                stream at that event, not a global buffer offset.
+        instance: Zero-based instance index for instanced draws (default: 0).
+        view: Zero-based multiview/array view index (default: 0).
+
+    Shader debugging is performed asynchronously by RenderDoc. If the returned
+    status is not complete, poll get_debug_trace(trace_id, "status") until the
+    status is complete, failed, or cancelled. Partial data is available after
+    failure. Release the trace when finished.
+    """
+    return bridge.call(
+        "debug_vertex",
+        {"event_id": event_id, "vertex": vertex, "instance": instance, "view": view},
+    )
+
+
+@mcp.tool
+def debug_pixel(
+    event_id: int,
+    x: int,
+    y: int,
+    primitive: int | None = None,
+    sample: int | None = None,
+    view: int | None = None,
+) -> dict:
+    """
+    Start debugging a pixel shader invocation and return a trace identifier.
+
+    Args:
+        event_id: Action event ID that issued the draw call (not a resource ID).
+        x: Pixel X coordinate in the render target, not normalized UV space.
+        y: Pixel Y coordinate in the render target, not normalized UV space.
+        primitive: Optional zero-based primitive index. Several primitives can
+                   cover the same pixel, so a pixel alone is ambiguous; when
+                   omitted, RenderDoc selects a fragment without a primitive preference.
+        sample: Optional MSAA sample index. When omitted, no preference is set;
+                multisampled edges may need an explicit sample.
+        view: Optional multiview/array view index. When omitted, no view preference is set.
+
+    Coordinates are integer pixel coordinates in the render target's viewport,
+    not normalized UVs. Shader debugging is asynchronous; poll
+    get_debug_trace(trace_id, "status")
+    until complete, failed, or cancelled. Partial data may also be available
+    after failure. Release the trace with release_debug_trace when finished.
+    """
+    params: dict[str, object] = {"event_id": event_id, "x": x, "y": y}
+    if primitive is not None:
+        params["primitive"] = primitive
+    if sample is not None:
+        params["sample"] = sample
+    if view is not None:
+        params["view"] = view
+    return bridge.call("debug_pixel", params)
+
+
+@mcp.tool
+def get_debug_trace(
+    trace_id: str,
+    section: Literal[
+        "status", "metadata", "states", "instructions", "sources"
+    ] = "status",
+    offset: int = 0,
+    limit: int = 100,
+) -> dict:
+    """
+    Read a previously started shader debug trace.
+
+    Args:
+        trace_id: Trace identifier returned by debug_vertex or debug_pixel.
+        section: Which part of the trace to return:
+                 - "status": asynchronous debugger progress/state.
+                 - "metadata": shader/event/input summary for the trace.
+                 - "states": debugger steps (variable changes per step).
+                 - "instructions": instruction-to-source mappings.
+                 - "sources": captured shader source files.
+        offset: Zero-based item offset for paged sections (default: 0).
+        limit: Maximum number of items to return per page (default: 100).
+
+    Shader debugging runs asynchronously after debug_vertex/debug_pixel, so
+    "status" may report queued, running, cancelling, complete, cancelled or failed.
+    Pages may be read while running or after failure; complete is true only for a
+    finished trace. offset and limit page list sections and invalid values are rejected.
+    """
+    return bridge.call(
+        "get_debug_trace",
+        {"trace_id": trace_id, "section": section, "offset": offset, "limit": limit},
+    )
+
+
+@mcp.tool
+def release_debug_trace(trace_id: str) -> dict:
+    """
+    Release a shader debug trace, or request cancellation if it is still running.
+
+    Args:
+        trace_id: Trace identifier returned by debug_vertex or debug_pixel.
+
+    A running trace is removed after cooperative cancellation finishes. A native
+    RenderDoc call already in progress cannot be interrupted immediately.
+    """
+    return bridge.call("release_debug_trace", {"trace_id": trace_id})
 
 
 @mcp.tool
@@ -226,7 +346,8 @@ def get_texture_info(resource_id: str) -> dict:
     Args:
         resource_id: The resource ID of the texture
 
-    Includes dimensions, format, mip levels, and other properties.
+    Includes dimensions and structured resource format (UNorm, sRGB and
+    compression where known). Use get_texture_views for event-specific view formats.
     """
     return bridge.call("get_texture_info", {"resource_id": resource_id})
 
@@ -258,6 +379,106 @@ def get_texture_data(
     if depth_slice is not None:
         params["depth_slice"] = depth_slice
     return bridge.call("get_texture_data", params)
+
+
+@mcp.tool
+def get_texture_views(resource_id: str, event_id: int) -> dict:
+    """
+    Enumerate the views through which a texture resource is bound at an event.
+
+    Args:
+        resource_id: The resource ID of the texture to inspect
+        event_id: The event ID whose pipeline bindings should be inspected
+
+    Views are resolved from the pipeline state at event_id, so different events
+    can bind the same texture with different view descriptions. Returns the
+    matching views with their binding kind, slot, and view metadata.
+    """
+    return bridge.call(
+        "get_texture_views", {"resource_id": resource_id, "event_id": event_id}
+    )
+
+
+@mcp.tool
+def export_texture_2d(
+    resource_id: str,
+    event_id: int,
+    output_path: str,
+    file_type: Literal["dds", "png", "tga", "exr"],
+    mip: int = 0,
+    array_slice: int = 0,
+    sample: int = 0,
+) -> dict:
+    """
+    Export one 2D subresource of a texture to a file.
+
+    Args:
+        resource_id: The resource ID of the texture to export
+        event_id: Action event ID whose replay state supplies the texture contents
+        output_path: Destination file path for the exported image
+        file_type: Output container format (dds, png, tga, exr)
+        mip: Mip level to export (default: 0)
+        array_slice: Array slice or cube face index (default: 0)
+                     For cube maps: 0=X+, 1=X-, 2=Y+, 3=Y-, 4=Z+, 5=Z-
+        sample: MSAA sample index (default: 0)
+
+    Exports a Texture2D subresource, not a Texture3D depth slice. RenderDoc may
+    convert unsupported formats even when writing DDS. PNG/TGA/EXR may clamp or
+    quantize values. This exports the resource interpretation, not a selected
+    descriptor view or its swizzle. Existing files are not overwritten.
+    """
+    return bridge.call(
+        "export_texture_2d",
+        {
+            "resource_id": resource_id,
+            "event_id": event_id,
+            "output_path": output_path,
+            "file_type": file_type,
+            "mip": mip,
+            "array_slice": array_slice,
+            "sample": sample,
+        },
+    )
+
+
+@mcp.tool
+def export_texture_3d_atlas(
+    resource_id: str,
+    event_id: int,
+    output_path: str,
+    file_type: Literal["dds", "png", "tga", "exr"],
+    mip: int = 0,
+    columns: int = 8,
+) -> dict:
+    """
+    Export a 3D texture volume as a 2D atlas grid.
+
+    Args:
+        resource_id: The resource ID of the 3D texture to export
+        event_id: Action event ID whose replay state supplies the texture contents
+        output_path: Destination file path for the exported atlas
+        file_type: Output container format (dds, png, tga, exr)
+        mip: Mip level to export (currently only 0 due to RenderDoc 1.48's
+             unsafe higher-mip 3D save path)
+        columns: Number of depth slices per atlas row (default: 8)
+
+    Slices are laid out left to right, top to bottom, and the last row is padded
+    when the slice count is not a multiple of columns. The atlas is a flattened
+    2D image: depth becomes a grid, so the result no longer carries volume
+    semantics. Output conversion may change precision and numeric values.
+    DDS atlases require compatible slice formats and block alignment.
+    """
+    return bridge.call(
+        "export_texture_3d_atlas",
+        {
+            "resource_id": resource_id,
+            "event_id": event_id,
+            "output_path": output_path,
+            "file_type": file_type,
+            "mip": mip,
+            "columns": columns,
+        },
+    )
 
 
 @mcp.tool

@@ -22,9 +22,16 @@ class RequestHandler:
             "get_draw_call_details": self._handle_get_draw_call_details,
             "get_action_timings": self._handle_get_action_timings,
             "get_shader_info": self._handle_get_shader_info,
+            "debug_vertex": self._handle_debug_vertex,
+            "debug_pixel": self._handle_debug_pixel,
+            "get_debug_trace": self._handle_get_debug_trace,
+            "release_debug_trace": self._handle_release_debug_trace,
             "get_buffer_contents": self._handle_get_buffer_contents,
             "get_texture_info": self._handle_get_texture_info,
             "get_texture_data": self._handle_get_texture_data,
+            "get_texture_views": self._handle_get_texture_views,
+            "export_texture_2d": self._handle_export_texture_2d,
+            "export_texture_3d_atlas": self._handle_export_texture_3d_atlas,
             "get_pipeline_state": self._handle_get_pipeline_state,
             "list_captures": self._handle_list_captures,
             "open_capture": self._handle_open_capture,
@@ -136,6 +143,51 @@ class RequestHandler:
             raise ValueError("stage is required")
         return self.facade.get_shader_info(int(event_id), stage)
 
+    def _handle_debug_vertex(self, params):
+        """Handle debug_vertex request"""
+        event_id = params.get("event_id")
+        vertex = params.get("vertex")
+        if event_id is None:
+            raise ValueError("event_id is required")
+        if vertex is None:
+            raise ValueError("vertex is required")
+        instance = params.get("instance", 0)
+        view = params.get("view", 0)
+        return self.facade.debug_vertex(event_id, vertex, instance, view)
+
+    def _handle_debug_pixel(self, params):
+        """Handle debug_pixel request"""
+        event_id = params.get("event_id")
+        x = params.get("x")
+        y = params.get("y")
+        if event_id is None:
+            raise ValueError("event_id is required")
+        if x is None:
+            raise ValueError("x is required")
+        if y is None:
+            raise ValueError("y is required")
+        primitive = params.get("primitive")
+        sample = params.get("sample")
+        view = params.get("view")
+        return self.facade.debug_pixel(event_id, x, y, primitive, sample, view)
+
+    def _handle_get_debug_trace(self, params):
+        """Handle get_debug_trace request"""
+        trace_id = params.get("trace_id")
+        if trace_id is None:
+            raise ValueError("trace_id is required")
+        section = params.get("section", "status")
+        offset = params.get("offset", 0)
+        limit = params.get("limit", 100)
+        return self.facade.get_debug_trace(trace_id, section, offset, limit)
+
+    def _handle_release_debug_trace(self, params):
+        """Handle release_debug_trace request"""
+        trace_id = params.get("trace_id")
+        if trace_id is None:
+            raise ValueError("trace_id is required")
+        return self.facade.release_debug_trace(trace_id)
+
     def _handle_get_buffer_contents(self, params):
         """Handle get_buffer_contents request"""
         resource_id = params.get("resource_id")
@@ -162,6 +214,68 @@ class RequestHandler:
         sample = params.get("sample", 0)
         depth_slice = params.get("depth_slice")  # None = full volume
         return self.facade.get_texture_data(resource_id, mip, slice_idx, sample, depth_slice)
+
+    def _handle_get_texture_views(self, params):
+        """Handle get_texture_views request"""
+        resource_id = params.get("resource_id")
+        event_id = params.get("event_id")
+        if resource_id is None:
+            raise ValueError("resource_id is required")
+        if event_id is None:
+            raise ValueError("event_id is required")
+        return self.facade.get_texture_views(resource_id, event_id)
+
+    def _handle_export_texture_2d(self, params):
+        """Handle export_texture_2d request"""
+        resource_id = params.get("resource_id")
+        event_id = params.get("event_id")
+        output_path = params.get("output_path")
+        file_type = params.get("file_type")
+        if resource_id is None:
+            raise ValueError("resource_id is required")
+        if event_id is None:
+            raise ValueError("event_id is required")
+        if output_path is None:
+            raise ValueError("output_path is required")
+        if file_type is None:
+            raise ValueError("file_type is required")
+        mip = params.get("mip", 0)
+        array_slice = params.get("array_slice", 0)
+        sample = params.get("sample", 0)
+        return self.facade.export_texture_2d(
+            resource_id,
+            event_id,
+            output_path,
+            file_type,
+            mip,
+            array_slice,
+            sample,
+        )
+
+    def _handle_export_texture_3d_atlas(self, params):
+        """Handle export_texture_3d_atlas request"""
+        resource_id = params.get("resource_id")
+        event_id = params.get("event_id")
+        output_path = params.get("output_path")
+        file_type = params.get("file_type")
+        if resource_id is None:
+            raise ValueError("resource_id is required")
+        if event_id is None:
+            raise ValueError("event_id is required")
+        if output_path is None:
+            raise ValueError("output_path is required")
+        if file_type is None:
+            raise ValueError("file_type is required")
+        mip = params.get("mip", 0)
+        columns = params.get("columns", 8)
+        return self.facade.export_texture_3d_atlas(
+            resource_id,
+            event_id,
+            output_path,
+            file_type,
+            mip,
+            columns,
+        )
 
     def _handle_get_pipeline_state(self, params):
         """Handle get_pipeline_state request"""

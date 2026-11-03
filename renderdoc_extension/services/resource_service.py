@@ -7,6 +7,7 @@ import base64
 import renderdoc as rd
 
 from ..utils import Parsers
+from .texture_view_service import describe_format
 
 
 class ResourceService:
@@ -93,6 +94,9 @@ class ResourceService:
                     "array_size": tex_desc.arraysize,
                     "mip_levels": tex_desc.mips,
                     "format": str(tex_desc.format.Name()),
+                    "resource_format": describe_format(tex_desc.format),
+                    "resource_dimension": tex_desc.dimension,
+                    "cubemap": tex_desc.cubemap,
                     "dimension": str(tex_desc.type),
                     "msaa_samples": tex_desc.msSamp,
                     "byte_size": tex_desc.byteSize,

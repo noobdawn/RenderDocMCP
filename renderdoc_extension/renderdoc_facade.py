@@ -11,6 +11,9 @@ from .services import (
     ResourceService,
     PipelineService,
 )
+from .services.shader_debug_service import ShaderDebugService
+from .services.texture_export_service import TextureExportService
+from .services.texture_view_service import TextureViewService
 
 
 class RenderDocFacade:
@@ -23,6 +26,8 @@ class RenderDocFacade:
     - SearchService: Reverse lookup searches
     - ResourceService: Texture and buffer data
     - PipelineService: Pipeline state and shader info
+    - TextureViewService: Texture view enumeration
+    - TextureExportService: Texture export to image files
     """
 
     def __init__(self, ctx):
@@ -40,6 +45,9 @@ class RenderDocFacade:
         self._search = SearchService(ctx, self._invoke)
         self._resource = ResourceService(ctx, self._invoke)
         self._pipeline = PipelineService(ctx, self._invoke)
+        self._texture_views = TextureViewService(ctx, self._invoke)
+        self._texture_export = TextureExportService(ctx, self._invoke)
+        self._debug = ShaderDebugService(ctx)
 
     def _invoke(self, callback):
         """Invoke callback on replay thread via BlockInvoke"""
@@ -126,6 +134,50 @@ class RenderDocFacade:
         """Get texture pixel data"""
         return self._resource.get_texture_data(resource_id, mip, slice, sample, depth_slice)
 
+    def get_texture_views(self, resource_id, event_id):
+        """Enumerate texture views bound at an event"""
+        return self._texture_views.get_texture_views(resource_id, event_id)
+
+    def export_texture_2d(
+        self,
+        resource_id,
+        event_id,
+        output_path,
+        file_type,
+        mip=0,
+        array_slice=0,
+        sample=0,
+    ):
+        """Export one 2D texture subresource to a file"""
+        return self._texture_export.export_texture_2d(
+            resource_id,
+            event_id,
+            output_path,
+            file_type,
+            mip,
+            array_slice,
+            sample,
+        )
+
+    def export_texture_3d_atlas(
+        self,
+        resource_id,
+        event_id,
+        output_path,
+        file_type,
+        mip=0,
+        columns=8,
+    ):
+        """Export a 3D texture volume as a 2D atlas grid"""
+        return self._texture_export.export_texture_3d_atlas(
+            resource_id,
+            event_id,
+            output_path,
+            file_type,
+            mip,
+            columns,
+        )
+
     # ==================== Pipeline Operations ====================
 
     def get_shader_info(self, event_id, stage):
@@ -135,3 +187,30 @@ class RenderDocFacade:
     def get_pipeline_state(self, event_id):
         """Get full pipeline state at an event"""
         return self._pipeline.get_pipeline_state(event_id)
+
+    # ==================== Shader Debug Operations ====================
+
+    def debug_vertex(self, event_id, vertex, instance=0, view=0):
+        """Start debugging a vertex shader invocation"""
+        return self._debug.start_vertex(event_id, vertex, instance, view)
+
+    def debug_pixel(self, event_id, x, y, primitive=None, sample=None, view=None):
+        """Start debugging a pixel shader invocation"""
+        return self._debug.start_pixel(event_id, x, y, primitive, sample, view)
+
+    def get_debug_trace(self, trace_id, section="status", offset=0, limit=100):
+        """Read a section of a shader debug trace"""
+        return self._debug.get_trace(trace_id, section, offset, limit)
+
+    def release_debug_trace(self, trace_id):
+        """Release a retained shader debug trace"""
+        return self._debug.release(trace_id)
+
+    # ==================== Lifecycle ====================
+
+    def shutdown(self):
+        """Release shader debug traces and stop the debug service"""
+        return self._debug.shutdown()
+
+    def capture_closing(self, replay_available=False):
+        return self._debug.capture_closing(replay_available)

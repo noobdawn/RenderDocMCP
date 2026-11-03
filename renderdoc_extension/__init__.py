@@ -11,6 +11,8 @@ from . import renderdoc_facade
 _context = None
 _server = None
 _version = ""
+_facade = None
+_viewer = None
 
 # Try to import qrenderdoc for UI integration (only available in RenderDoc)
 try:
@@ -29,13 +31,33 @@ def register(version, ctx):
         version: RenderDoc version string (e.g., "1.20")
         ctx: CaptureContext handle
     """
-    global _context, _server, _version
+    global _context, _server, _version, _facade, _viewer
     _version = version
     _context = ctx
 
     # Create facade and handler
-    facade = renderdoc_facade.RenderDocFacade(ctx)
-    handler = request_handler.RequestHandler(facade)
+    _facade = renderdoc_facade.RenderDocFacade(ctx)
+    handler = request_handler.RequestHandler(_facade)
+    if _has_qrenderdoc:
+        class CaptureLifecycle(qrd.CaptureViewer):
+            def __init__(self, facade):
+                super(CaptureLifecycle, self).__init__()
+                self.facade = facade
+
+            def OnCaptureLoaded(self):
+                return None
+
+            def OnCaptureClosed(self):
+                self.facade.capture_closing(replay_available=True)
+
+            def OnSelectedEventChanged(self, event_id):
+                return None
+
+            def OnEventChanged(self, event_id):
+                return None
+
+        _viewer = CaptureLifecycle(_facade)
+        ctx.AddCaptureViewer(_viewer)
 
     # Start socket server
     _server = socket_server.MCPBridgeServer(
@@ -58,10 +80,16 @@ def register(version, ctx):
 
 def unregister():
     """Called when extension is unloaded"""
-    global _server
+    global _server, _facade, _viewer
     if _server:
         _server.stop()
         _server = None
+    if _viewer:
+        _context.RemoveCaptureViewer(_viewer)
+        _viewer = None
+    if _facade:
+        _facade.shutdown()
+        _facade = None
     print("[MCP Bridge] Extension unloaded")
 
 
