@@ -22,6 +22,7 @@ class RequestHandler:
             "get_draw_call_details": self._handle_get_draw_call_details,
             "get_action_timings": self._handle_get_action_timings,
             "get_shader_info": self._handle_get_shader_info,
+            "export_shader_mapped_source": self._handle_export_shader_mapped_source,
             "debug_vertex": self._handle_debug_vertex,
             "debug_pixel": self._handle_debug_pixel,
             "get_debug_trace": self._handle_get_debug_trace,
@@ -142,6 +143,13 @@ class RequestHandler:
         if stage is None:
             raise ValueError("stage is required")
         return self.facade.get_shader_info(int(event_id), stage)
+
+    def _handle_export_shader_mapped_source(self, params):
+        for name in ("event_id", "stage", "output_path"):
+            if params.get(name) is None:
+                raise ValueError("%s is required" % name)
+        return self.facade.export_shader_mapped_source(
+            params["event_id"], params["stage"], params["output_path"])
 
     def _handle_debug_vertex(self, params):
         """Handle debug_vertex request"""

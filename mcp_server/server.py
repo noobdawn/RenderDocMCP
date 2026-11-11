@@ -201,6 +201,27 @@ def get_shader_info(
 
 
 @mcp.tool
+def export_shader_mapped_source(
+    event_id: int,
+    stage: Literal["vertex", "hull", "domain", "geometry", "pixel", "compute"],
+    output_path: str,
+) -> dict:
+    """Export source lines mapped to retained DXIL instructions to an HLSL file.
+
+    Uses DXC DXIL debug locations without running a shader debug invocation.
+    Requires available matching source/debug metadata and the DXC DXIL target.
+    Output preserves original file names and line numbers with #line directives;
+    it is a reading excerpt, not a guaranteed compilable shader. Missing mappings
+    do not prove source was optimized away. Runtime branches remain included.
+    output_path must be absolute, end in .hlsl, and have an existing parent.
+    Existing files are never overwritten.
+    """
+    return bridge.call("export_shader_mapped_source", {
+        "event_id": event_id, "stage": stage, "output_path": output_path,
+    })
+
+
+@mcp.tool
 def debug_vertex(
     event_id: int,
     vertex: int,
@@ -272,7 +293,7 @@ def debug_pixel(
 def get_debug_trace(
     trace_id: str,
     section: Literal[
-        "status", "metadata", "states", "instructions", "sources"
+        "status", "metadata", "states", "state_deltas", "instructions", "sources", "source_variables", "source_steps", "mapping_definitions"
     ] = "status",
     offset: int = 0,
     limit: int = 100,
@@ -286,15 +307,23 @@ def get_debug_trace(
                  - "status": asynchronous debugger progress/state.
                  - "metadata": shader/event/input summary for the trace.
                  - "states": debugger steps (variable changes per step).
-                 - "instructions": instruction-to-source mappings.
-                 - "sources": captured shader source files.
+                 - "state_deltas": ordered compact states with inline baselines and patches;
+                   decode from offset 0 with StateDecoder. Counts share the states count.
+                 - "source_steps": consecutive source-location groups with net variable changes.
+                 - "instructions": confirmed executed instructions and source mappings.
+                 - "sources": deduplicated observed source lines.
+                 - "source_variables": mapping_ids referencing shared mapping definitions.
+                 - "mapping_definitions": complete deduplicated source variable mappings.
         offset: Zero-based item offset for paged sections (default: 0).
         limit: Maximum number of items to return per page (default: 100).
 
     Shader debugging runs asynchronously after debug_vertex/debug_pixel, so
     "status" may report queued, running, cancelling, complete, cancelled or failed.
     Pages may be read while running or after failure; complete is true only for a
-    finished trace. offset and limit page list sections and invalid values are rejected.
+    finished trace. Instructions are unique confirmed transitions in first-execution
+    order; source lines use original file indices and line numbers. Source variable
+    snapshots are referenced by source_variables_id. For complete shader source,
+    use get_shader_info. A failed or cancelled trace can contain partial data.
     """
     return bridge.call(
         "get_debug_trace",

@@ -4,9 +4,10 @@ import traceback
 import renderdoc as rd
 
 from .shader_trace_store import ShaderTraceStore
+from .shader_executed_mapping import ExecutedMapping
+from .shader_source_steps import SourceSteps
 from ..utils.shader_debug_serializer import (
     serialize_debug_state,
-    serialize_instruction_source_info,
     serialize_shader_variables,
     serialize_source_variable_mappings,
 )
@@ -55,7 +56,7 @@ class ShaderDebugService:
         job = self.store.create(stage, event_id, capture, invocation)
         trace_id = job["trace_id"]
         self._job = {"trace_id": trace_id, "stage": stage, "action": action_data,
-                     "invocation": invocation, "trace": None, "has_states": False,
+                 "invocation": invocation, "trace": None, "has_states": False, "mapping": None,
                      "in_flight": False, "finalized": False}
         try:
             from PySide2.QtCore import QTimer
@@ -116,6 +117,13 @@ class ShaderDebugService:
             return
         job["finalized"] = True
         trace, job["trace"] = job["trace"], None
+        if job.get("source_steps") is not None:
+            try:
+                job["source_steps"].flush()
+            except Exception as exc:
+                status, error = "failed", "Failed to store source steps: %s" % exc
+            job["source_steps"] = None
+        job["mapping"] = None
         if trace is not None:
             try:
                 controller.FreeTrace(trace)
@@ -166,7 +174,8 @@ class ShaderDebugService:
                 self.store.update(trace_id, invocation=resolved)
                 if job["trace"] is None or job["trace"].debugger is None:
                     raise ValueError("RenderDoc could not initialize shader debugging for this invocation")
-                self._write_trace(controller, pipe, reflection, trace_id, job["trace"])
+                job["mapping"] = self._write_trace(controller, pipe, reflection, trace_id, job["trace"])
+                job["source_steps"] = SourceSteps(job["mapping"])
             elif not self.store.cancelled(trace_id):
                 batch = controller.ContinueDebug(job["trace"].debugger)
                 if not batch:
@@ -177,7 +186,10 @@ class ShaderDebugService:
                     for state in batch:
                         if self.store.cancelled(trace_id):
                             break
-                        self.store.append(trace_id, "states", serialize_debug_state(state))
+                        serialized = serialize_debug_state(state)
+                        self.store.append(trace_id, "states", serialized)
+                        job["source_steps"].observe(serialized)
+                        job["mapping"].observe(state)
                         job["has_states"] = True
             if self.store.cancelled(trace_id):
                 status = "cancelled"
@@ -195,7 +207,7 @@ class ShaderDebugService:
             job["in_flight"] = False
 
     def _write_trace(self, controller, pipe, reflection, trace_id, trace):
-        disassembly = controller.DisassembleShader(pipe.GetGraphicsPipelineObject(), reflection, "").splitlines()
+        disassembly = controller.DisassembleShader(pipe.GetGraphicsPipelineObject(), reflection, "")
         debug = reflection.debugInfo
         metadata = {
             "shader_id": str(reflection.resourceId), "entry_point": reflection.entryPoint,
@@ -209,18 +221,12 @@ class ShaderDebugService:
             "samplers": serialize_shader_variables(trace.samplers),
             "source_variables": serialize_source_variable_mappings(trace.sourceVars),
             "step_semantics": "changes describe the transition into this state; next_instruction executes next",
+            "instruction_scope": "confirmed state transitions for the selected invocation",
+            "state_encoding": "delta-v1; states is reconstructed, state_deltas must be decoded from start",
             "pixel_selection_warning": "RenderDoc may select another overlapping fragment; fragIndex is not a selector",
         }
         self.store.update(trace_id, metadata=metadata)
-        for source in debug.files:
-            if self.store.cancelled(trace_id):
-                return False
-            self.store.append(trace_id, "sources", {"filename": source.filename, "contents": source.contents})
-        for info in trace.instInfo:
-            if self.store.cancelled(trace_id):
-                return False
-            item = serialize_instruction_source_info(info, debug.files, disassembly)
-            self.store.append(trace_id, "instructions", item)
+        return ExecutedMapping(trace, debug.files, disassembly, self.store, trace_id)
 
     def get_trace(self, trace_id, section, offset, limit):
         self._check_numbers(offset=offset, limit=limit)

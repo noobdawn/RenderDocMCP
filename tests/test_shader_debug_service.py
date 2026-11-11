@@ -104,7 +104,7 @@ def make_reflection(files=None, debuggable=True, status="debuggable"):
 
 def make_state(step, changes=None):
     return SimpleNamespace(
-        stepIndex=step, nextInstruction=10 + step, flags=0,
+        stepIndex=step, nextInstruction=2 + step, flags=0,
         callstack=["main"], changes=changes or [],
     )
 
@@ -303,7 +303,7 @@ def test_vertex_indexed_trace_uses_offset_and_base_and_serializes_source(api):
     assert status["status"] == "complete"
     assert status["complete"] is True
     assert status["invocation"]["resolved_index"] == 107
-    assert status["counts"] == {"states": 3, "instructions": 2, "sources": 1}
+    assert status["counts"] == {"states": 3, "instructions": 2, "sources": 1, "source_variables": 1, "source_steps": 1, "mapping_definitions": 0}
 
     metadata = section(env, job["trace_id"], "metadata")["result"]["metadata"]
     assert metadata["shader_id"] == "ResourceId::77"
@@ -312,12 +312,10 @@ def test_vertex_indexed_trace_uses_offset_and_base_and_serializes_source(api):
     assert metadata["inputs"][0]["value"] == [1.0, 2.0]
 
     sources = section(env, job["trace_id"], "sources")["result"]["items"]
-    assert sources == [{
-        "filename": "shader.hlsl", "contents": "zero\nfloat4 main()\nthree\n",
-    }]
+    assert sources == [{"file_index": 0, "filename": "shader.hlsl", "line": 2, "text": "float4 main()"}]
     instructions = section(env, job["trace_id"], "instructions")["result"]["items"]
     assert [item["instruction"] for item in instructions] == [3, 4]
-    assert instructions[0]["line_info"]["source_line"] == "float4 main()"
+    assert instructions[0]["line_info"]["line_start"] == 2
     assert instructions[0]["line_info"]["disassembly_line_text"] == "op zero"
 
     states = section(env, job["trace_id"], "states")["result"]["items"]
@@ -376,7 +374,179 @@ def test_pixel_trace_maps_unset_inputs_to_no_preference(api):
     assert status["status"] == "complete"
     assert status["invocation"] == {"x": 3, "y": 4, "primitive": 2, "sample": None, "view": 7}
     states = section(env, job["trace_id"], "states")["result"]["items"]
-    assert states[0]["next_instruction"] == 11
+    assert states[0]["next_instruction"] == 3
+
+
+def test_executed_mappings_follow_transitions_across_batches_and_deduplicate(api):
+    trace = make_trace()
+    states = [make_state(i) for i in range(1, 6)]
+    for state, instruction in zip(states, [5, 9, 5, 9, 42]):
+        state.nextInstruction = instruction
+    trace.instInfo[0].instruction = 3
+    trace.instInfo[1].instruction = 8
+    controller = Controller(make_reflection(), trace, batches=[states[:2], states[2:]])
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+
+    env.ctx.replay.drain()
+
+    result = section(env, trace_id, "instructions", 0, 1)["result"]
+    next_page = section(env, trace_id, "instructions", result["next_offset"], 1)["result"]
+    items = result["items"] + next_page["items"]
+    assert [(item["instruction"], item["mapping_instruction"]) for item in items] == [(5, 3), (9, 8)]
+    assert next_page["next_offset"] is None
+    assert len(section(env, trace_id, "states")["result"]["items"]) == 5
+    assert len(section(env, trace_id, "sources")["result"]["items"]) == 1
+    assert len(section(env, trace_id, "source_variables")["result"]["items"]) == 1
+    assert env.facade._debug._job["mapping"] is None
+
+
+def test_unmapped_instruction_remains_visible_without_fabricating_source(api):
+    trace = make_trace()
+    states = [make_state(1), make_state(2)]
+    states[0].nextInstruction = 1
+    controller = Controller(make_reflection(), trace, batches=[states])
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+
+    env.ctx.replay.drain()
+
+    items = section(env, trace_id, "instructions")["result"]["items"]
+    assert items == [{"instruction": 1, "mapping_instruction": None,
+                      "line_info": None, "source_variables_id": None}]
+    assert section(env, trace_id, "sources")["result"]["items"] == []
+
+
+def test_large_unexecuted_instruction_inventory_does_not_consume_trace_quota(api):
+    trace = make_trace()
+    line = trace.instInfo[0].lineInfo
+    trace.instInfo = [SimpleNamespace(instruction=i, lineInfo=line, sourceVars=[]) for i in range(2000)]
+    states = [make_state(1), make_state(2)]
+    states[0].nextInstruction = 1000
+    controller = Controller(make_reflection(), trace, batches=[states])
+    env = create_env(api, controller, make_action())
+    env.facade._debug.store._max_bytes = 10000
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+
+    env.ctx.replay.drain()
+
+    status = section(env, trace_id, "status")["result"]
+    assert status["status"] == "complete"
+    assert status["counts"]["states"] == 2
+    assert [item["instruction"] for item in section(env, trace_id, "instructions")["result"]["items"]] == [1000]
+
+
+def test_failed_trace_keeps_confirmed_transitions_but_not_pending_instruction(api):
+    trace = make_trace()
+    controller = Controller(make_reflection(), trace, batches=[[make_state(1), make_state(2)]])
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+    env.facade._debug.pump()
+    env.ctx.replay.pending.pop(0)(controller)
+    env.facade._debug.pump()
+    env.ctx.replay.pending.pop(0)(controller)
+    controller.continue_error = RuntimeError("next batch failed")
+
+    env.ctx.replay.drain()
+
+    assert section(env, trace_id, "status")["result"]["status"] == "failed"
+    assert [item["instruction"] for item in section(env, trace_id, "instructions")["result"]["items"]] == [3]
+    assert controller.freed == [trace]
+
+
+def test_source_steps_merge_consecutive_locations_and_preserve_loop_boundaries(api):
+    trace = make_trace()
+    states = [make_state(i) for i in range(5)]
+    for state, instruction in zip(states, [3, 4, 3, 4, 5]):
+        state.nextInstruction = instruction
+    states[1].changes = [SimpleNamespace(before=float_var("x", [0.0]), after=float_var("x", [1.0]))]
+    states[2].changes = [SimpleNamespace(before=float_var("x", [1.0]), after=float_var("x", [2.0]))]
+    controller = Controller(make_reflection(), trace, batches=[states[:2], states[2:]])
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+
+    env.ctx.replay.drain()
+
+    first = section(env, trace_id, "source_steps", 0, 1)["result"]
+    second = section(env, trace_id, "source_steps", first["next_offset"], 1)["result"]
+    assert first["items"][0]["transitions"] == 2
+    assert first["items"][0]["changes"]["x"] == {
+        "before": [0.0], "before_present": True, "after": [2.0],
+        "after_present": True, "updates": 2}
+    assert [(g["step_start"], g["step_end"]) for g in first["items"] + second["items"]] == [(1, 2), (3, 4)]
+    assert second["next_offset"] is None
+    assert len(section(env, trace_id, "states")["result"]["items"]) == 5
+
+
+def test_compact_source_step_resource_retains_direct_descriptor_store(api):
+    module = importlib.import_module("renderdoc_extension.services.shader_source_steps")
+    binding = {"index": 7}
+    result = module.compact_value({"binding": binding,
+                                  "direct_access": {"descriptor_store": "1234"}})
+    assert result == {"binding": {"index": 7}, "direct_access": {"descriptor_store": "1234"}}
+
+
+def test_mapping_failure_keeps_stored_transition_in_partial_source_steps(api):
+    controller = Controller(make_reflection(), make_trace(), batches=[[make_state(0), make_state(1)]])
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+    env.facade._debug.pump()
+    env.ctx.replay.pending.pop(0)(controller)
+    original = env.facade._debug._job["mapping"].observe
+    def fail_mapping(state):
+        if state.stepIndex == 1:
+            raise RuntimeError("mapping failed")
+        original(state)
+    env.facade._debug._job["mapping"].observe = fail_mapping
+
+    env.ctx.replay.drain()
+
+    assert section(env, trace_id, "status")["result"]["status"] == "failed"
+    items = section(env, trace_id, "source_steps")["result"]["items"]
+    assert [(item["step_start"], item["step_end"], item["transitions"]) for item in items] == [(1, 1, 1)]
+
+
+def test_source_variable_snapshots_share_definitions_and_restore_order(api):
+    def mapping(name):
+        return SimpleNamespace(name=name, type="VarType.Float", undefinedValue=False,
+            rows=1, columns=1, offset=0, signatureIndex=0,
+            variables=[SimpleNamespace(name=name, type="DebugVariableType.Variable", component=0)])
+    trace = make_trace()
+    a, b = mapping("a"), mapping("b")
+    trace.instInfo[0].sourceVars = [a, b]
+    trace.instInfo[1].sourceVars = [b, a]
+    controller = Controller(make_reflection(), trace, batches=[[make_state(1), make_state(2), make_state(3)]])
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+
+    env.ctx.replay.drain()
+
+    definitions = {item["id"]: item["mapping"] for item in section(env, trace_id, "mapping_definitions")["result"]["items"]}
+    snapshots = section(env, trace_id, "source_variables")["result"]["items"]
+    assert len(definitions) == 2
+    assert [[definitions[i]["name"] for i in item["mapping_ids"]] for item in snapshots] == [["a", "b"], ["b", "a"]]
+
+
+def test_nop_runs_fold_but_changed_or_flagged_nops_remain_visible(api):
+    trace = make_trace()
+    line = trace.instInfo[0].lineInfo
+    trace.instInfo = [SimpleNamespace(instruction=i, lineInfo=line, sourceVars=[]) for i in range(4)]
+    states = [make_state(i) for i in range(5)]
+    for state, instruction in zip(states, [0, 1, 2, 3, 3]):
+        state.nextInstruction = instruction
+    states[3].flags = 2
+    states[4].changes = [SimpleNamespace(before=absent_var(), after=float_var("x", [1.0]))]
+    controller = Controller(make_reflection(), trace, batches=[states])
+    controller.DisassembleShader = lambda *args: "nop;"
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+
+    env.ctx.replay.drain()
+
+    groups = section(env, trace_id, "source_steps")["result"]["items"]
+    assert [(g["kind"], g["transitions"]) for g in groups] == [("auxiliary", 2), ("source", 2)]
+    assert groups[1]["flags_value"] == 2
+    assert groups[1]["changes"]["x"]["after"] == [1.0]
 
 
 def test_pagination_is_stable_and_tracks_queued_and_complete_status(api):
@@ -444,7 +614,7 @@ def test_failure_before_trace_creation_reports_debuggability_error(api):
     status = section(env, trace_id, "status")["result"]
     assert status["status"] == "failed"
     assert status["error"] == "ValueError: Shader is not debuggable: no debug info"
-    assert status["counts"] == {"states": 0, "instructions": 0, "sources": 0}
+    assert status["counts"] == {"states": 0, "instructions": 0, "sources": 0, "source_variables": 0, "source_steps": 0, "mapping_definitions": 0}
     assert controller.freed == []
     assert controller.frame_events == [(10, True), (999, True)]
 
@@ -615,6 +785,43 @@ def test_start_validation_rejects_bad_invocations(api):
     assert response["error"]["message"] == "Event 10 is not a draw call"
 
 
+def test_delta_storage_reconstructs_pages_without_duplicate_snapshots(api):
+    controller = Controller(make_reflection(), make_trace(), batches=[[
+        make_state(0, [SimpleNamespace(before=absent_var(), after=float_var("x", [1.0]))]),
+        make_state(1, [SimpleNamespace(before=float_var("x", [1.0]), after=float_var("x", [2.0]))]),
+        make_state(2)]])
+    env = create_env(api, controller, make_action())
+    trace_id = call(env, "debug_vertex", event_id=10, vertex=0)["result"]["trace_id"]
+    env.ctx.replay.drain()
+
+    page = section(env, trace_id, "states", 1, 1)["result"]
+    repeated = section(env, trace_id, "states", 1, 1)["result"]
+    delta = section(env, trace_id, "state_deltas", 1, 1)["result"]["items"][0]
+
+    assert repeated == page
+    assert page["items"][0]["changes"][0]["before"]["value"] == [1.0]
+    assert page["items"][0]["changes"][0]["after"]["value"] == [2.0]
+    assert delta["changes"][0]["before"] == {"id": 0}
+    assert delta["changes"][0]["after"]["patch"] == [{"op": "set", "path": ["value", 0], "value": 2.0}]
+    assert section(env, trace_id, "states", 2, 1)["result"]["items"][0]["callstack"] == ["main"]
+
+
+def test_rejected_delta_append_does_not_publish_missing_baselines(api):
+    store = api.store(max_bytes=300)
+    trace_id = store.create("pixel", 10, "capture.rdc", {})["trace_id"]
+    serializer = importlib.import_module("renderdoc_extension.utils.shader_debug_serializer")
+    large = serializer.serialize_debug_state(make_state(0, [
+        SimpleNamespace(before=absent_var(), after=float_var("huge", [1.0] * 100))]))
+    with pytest.raises(RuntimeError, match="storage limit"):
+        store.append(trace_id, "states", large)
+    small = serializer.serialize_debug_state(make_state(1))
+
+    store.append(trace_id, "states", small)
+
+    assert store.get(trace_id, "states", 0, 1)["items"] == [small]
+    store.close()
+
+
 def test_trace_store_quota_and_read_validation(api):
     store = api.store(max_bytes=32)
     trace_id = store.create("vertex", 10, "capture.rdc", {})["trace_id"]
@@ -633,5 +840,5 @@ def test_trace_store_quota_and_read_validation(api):
         store.get("missing", "status", 0, 1)
 
     job = store.get(trace_id, "status", 0, 1)
-    assert job["counts"] == {"states": 0, "instructions": 0, "sources": 0}
+    assert job["counts"] == {"states": 0, "instructions": 0, "sources": 0, "source_variables": 0, "source_steps": 0, "mapping_definitions": 0}
     store.close()

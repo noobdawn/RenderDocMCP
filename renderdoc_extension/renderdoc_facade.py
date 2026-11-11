@@ -14,6 +14,7 @@ from .services import (
 from .services.shader_debug_service import ShaderDebugService
 from .services.texture_export_service import TextureExportService
 from .services.texture_view_service import TextureViewService
+from .services.shader_source_export_service import ShaderSourceExportService
 
 
 class RenderDocFacade:
@@ -48,6 +49,7 @@ class RenderDocFacade:
         self._texture_views = TextureViewService(ctx, self._invoke)
         self._texture_export = TextureExportService(ctx, self._invoke)
         self._debug = ShaderDebugService(ctx)
+        self._source_export = ShaderSourceExportService(ctx, self._invoke)
 
     def _invoke(self, callback):
         """Invoke callback on replay thread via BlockInvoke"""
@@ -183,6 +185,9 @@ class RenderDocFacade:
     def get_shader_info(self, event_id, stage):
         """Get shader information for a specific stage"""
         return self._pipeline.get_shader_info(event_id, stage)
+
+    def export_shader_mapped_source(self, event_id, stage, output_path):
+        return self._source_export.export_shader_mapped_source(event_id, stage, output_path)
 
     def get_pipeline_state(self, event_id):
         """Get full pipeline state at an event"""
