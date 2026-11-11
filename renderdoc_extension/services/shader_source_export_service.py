@@ -10,6 +10,7 @@ only the DXC DXIL disassembly and its ``!dbg !DILocation`` metadata are parsed.
 import os
 import re
 from collections import namedtuple
+from .shader_selected_uniforms import collect_selected_uniforms, render_selected_uniforms
 
 _DXC_DXIL_TARGET = "DXC DXIL"
 _SHADER_STAGES = ("vertex", "hull", "domain", "geometry", "pixel", "compute")
@@ -740,7 +741,7 @@ class ShaderSourceExportService:
         if mapping is None:
             raise ValueError("Shader source mapping failed without a diagnostic")
 
-        text = render_mapped_hlsl(mapping, event, stage_name)
+        text = render_selected_uniforms(state["selected_uniforms"]) + render_mapped_hlsl(mapping, event, stage_name)
         size = _write_output(path, text)
         counts = dict(mapping.counts)
         counts["disassembly_lines"] = state["disassembly_lines"]
@@ -753,6 +754,8 @@ class ShaderSourceExportService:
             "stage": stage_name,
             "disassembly_target": _DXC_DXIL_TARGET,
             "shader": state["shader"],
+            "selected_uniform_buffers": len(state["selected_uniforms"]),
+            "selected_uniform_entries": sum(len(buffer["values"]) for buffer in state["selected_uniforms"]),
             "counts": counts,
             "source_files": mapping.files,
             "unresolved": mapping.unresolved,
@@ -829,6 +832,7 @@ class ShaderSourceExportService:
                 raise DxilSourceMappingError(_no_mapped_lines_message(mapping))
             state["mapping"] = mapping
             state["shader"] = _shader_provenance(reflection)
+            state["selected_uniforms"] = collect_selected_uniforms(controller, pipe, reflection, stage_enum, mapping, files)
         except DxilSourceMappingError as exc:
             state["fatal"] = str(exc)
         except Exception as exc:

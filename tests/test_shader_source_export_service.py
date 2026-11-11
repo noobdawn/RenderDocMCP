@@ -414,6 +414,63 @@ def test_compute_stage_uses_compute_pipeline(api):
     assert controller.disassembly_calls[0][2] == "DXC DXIL"
 
 
+def test_selected_uniforms_filter_identifiers_and_constant_array_indices(api):
+    module = importlib.import_module("renderdoc_extension.services.shader_selected_uniforms")
+    def scalar(name, value):
+        return SimpleNamespace(name=name, type="VarType.Float", rows=1, columns=1,
+            flags=0, members=[], value=SimpleNamespace(f32v=[value]))
+    variables = [scalar("Roughness", 0.42), scalar("Unused", 99),
+                 SimpleNamespace(name="Weights", members=[scalar("Weights[%d]" % i, i) for i in range(12)])]
+    block = SimpleNamespace(name="Material", variables=[SimpleNamespace(name=v.name) for v in variables],
+                            byteSize=64, bufferBacked=True)
+    reflection = build_reflection()
+    reflection.constantBlocks = [block]
+    mapping = SimpleNamespace(lines=[SimpleNamespace(text='float x = Material.Roughness + Weights[2]; // Unused')])
+    pipe = SimpleNamespace(GetGraphicsPipelineObject=lambda: "graphics", GetConstantBuffer=lambda *args:
+        SimpleNamespace(resourceId="buffer", byteOffset=0, byteSize=64))
+    controller = SimpleNamespace(GetCBufferVariableContents=lambda *args: variables)
+
+    buffers = module.collect_selected_uniforms(controller, pipe, reflection, "pixel", mapping)
+
+    assert [v["name"] for v in buffers[0]["values"]] == ["Material.Roughness", "Material.Weights[2]"]
+    assert buffers[0]["values"][0]["data"] == {"value": [0.42]}
+
+
+def test_dynamic_uniform_array_is_explicitly_previewed_not_fully_printed(api):
+    module = importlib.import_module("renderdoc_extension.services.shader_selected_uniforms")
+    members = [SimpleNamespace(name="Values[%d]" % i, type="VarType.Float", rows=1, columns=1,
+        flags=0, members=[], value=SimpleNamespace(f32v=[i])) for i in range(100)]
+    result = []
+
+    module._select(SimpleNamespace(name="Values", members=members), ["Values"], "Values[index]", "Values", result)
+
+    assert len(result) == 9
+    assert result[-1]["omitted_elements"] == 92
+    assert result[-1]["status"] == "preview"
+
+
+def test_uniform_selection_masks_comments_that_start_on_unmapped_lines(api):
+    module = importlib.import_module("renderdoc_extension.services.shader_selected_uniforms")
+    files = [api.SourceFile("a.hlsl", '/* comment\nUnused\n*/\nfloat x = Used;\n')]
+    mapping = SimpleNamespace(lines=[SimpleNamespace(filename="a.hlsl", line=2, text="Unused"),
+                                     SimpleNamespace(filename="a.hlsl", line=4, text="float x = Used;")])
+
+    text = module._source_text(mapping, files)
+
+    assert module._references(text, ["Unused"]) == []
+    assert len(module._references(text, ["Used"])) == 1
+
+
+def test_uniform_header_budget_reports_omission_instead_of_growing_unbounded(api):
+    module = importlib.import_module("renderdoc_extension.services.shader_selected_uniforms")
+
+    header = module.render_selected_uniforms([{"name": "Material", "values": [
+        {"name": "Big", "data": "x" * 70000}, {"name": "Small", "data": 1}]}])
+
+    assert len(header.encode("utf-8")) < 65536
+    assert "omitted 2 remaining entries" in header
+
+
 def test_missing_dxc_dxil_target_is_unsupported_and_restores(api):
     controller = Controller(
         build_reflection(), DISASSEMBLY, targets=("DXBC/DXIL",))
