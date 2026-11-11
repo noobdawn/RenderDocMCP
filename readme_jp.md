@@ -93,6 +93,7 @@ uv tool update-shell  # PATHに追加
 | `get_draw_call_details` | 特定のドローコールの詳細情報を取得 |
 | `get_action_timings` | 利用可能な GPU タイミングを取得 |
 | `get_shader_info` | シェーダーの逆アセンブリ、デバッグ情報内のソースコード、定数バッファの値を取得 |
+| `export_shader_mapped_source` | 保持された DXIL 命令に対応するソース行を書き出し |
 | `debug_vertex` / `debug_pixel` | 頂点またはピクセルのシェーダーデバッグを非同期で開始 |
 | `get_debug_trace` / `release_debug_trace` | トレースをページ単位で取得 / 解放 |
 | `get_buffer_contents` | バッファの内容を取得 (Base64) |
@@ -130,6 +131,19 @@ Settings > Core > Shader Debug Search Path にディレクトリを追加して�
 デバッグファイルにソースが含まれていなければ、逆アセンブリがあってもソースは
 取得できません。通常のアプリケーション用 PDB やソースディレクトリだけでは不十分です。
 
+### コンパイル後の命令に対応するソースを書き出し
+
+```python
+export_shader_mapped_source(event_id=7279, stage="pixel", output_path="D:\\out\\mapped_source.hlsl")
+```
+
+`DXC DXIL` のデバッグ位置から、保持された命令に対応するソース行のみを書き出します。
+デバッグ実行は不要で、保持された実行時分岐も含みます。特定ピクセルの実行経路ではありません。
+`#line` で元のファイル名と行番号を保持しますが、宣言やマクロが省略されるため再コンパイルは保証しません。
+DXIL と対応するソース情報、`DXC DXIL` ターゲットが必要です。行番号情報がないことは最適化による削除の証明ではありません。
+出力先は親ディレクトリが存在する絶対 `.hlsl` パスを指定し、既存ファイルは上書きしません。
+RenderDoc は ILDB デバッグバイトコードを逆アセンブルする場合があるため、最終 GPU 機械語や最適化の完全な証明ではありません。
+
 ### 頂点・ピクセルシェーダーのデバッグ
 
 ```
@@ -139,6 +153,7 @@ debug_pixel(event_id=11824, x=620, y=208, primitive=0)
 # 返された trace_id を使用する
 get_debug_trace(trace_id="...", section="status")
 get_debug_trace(trace_id="...", section="metadata")
+get_debug_trace(trace_id="...", section="source_steps", offset=0, limit=50)
 get_debug_trace(trace_id="...", section="states", offset=0, limit=50)
 get_debug_trace(trace_id="...", section="instructions", offset=0, limit=50)
 get_debug_trace(trace_id="...", section="sources")
@@ -151,6 +166,14 @@ release_debug_trace(trace_id="...")
 命令です。命令番号は連続とは限らず、命令情報が疎な場合は直前の番号が適用されます。
 64 ビット整数と GPU ポインタは精度を保つため十進文字列で返し、非有限浮動小数点値は
 `NaN`、`Infinity`、`-Infinity` の文字列で返します。
+
+変数の初回観測時のベースラインとメンバー差分を保存します。`states` は元の状態を再構築し、`state_deltas` は同じ件数のコンパクトな順序付きストリームを返します。`version=1` の内訳は `seed`/`create`、パス付き `patch`、`unset` と共有 `callstack_id` です。offset 0 から `shader_state_codec.StateDecoder` で順番に復元してください。ローカル変数の初期値は途中で初めて観測される場合があります。`source_steps` の集約規則は変わりません。
+
+`instructions` と `sources` は、選択した実行対象の確認済みデバッグステップと対応するソース行のみを表します。
+`sources` は重複を除いたファイルインデックス、元の行番号とテキストを返します。
+`instructions` の `source_variables_id` はページ取得可能な `source_variables` セクションを参照し、
+`mapping_instruction` は疎な命令情報の継承元を示します。ソースを取得できない場合や、失敗・キャンセルにより
+結果が部分的な場合があります。シェーダー全体のソースは `get_shader_info` で取得してください。
 
 `vertex` と `instance` は描画内のゼロ基準の番号です。インデックス描画では実際の
 頂点インデックスを解決し、結果の `invocation.resolved_index` に示します。
@@ -168,6 +191,13 @@ release_debug_trace(trace_id="...")
 トレースは拡張機能内の一時データで、拡張機能の再読み込みまたは終了時に消えます。
 異なる MCP サーバープロセスを同時に使う場合は、それぞれ対応する RenderDoc と同じ
 `RENDERDOC_MCP_IPC_DIR` を設定してディレクトリを分離してください。
+
+`source_steps` は連続するソース位置とコールスタックごとに確定済みステップを集約します。
+命令番号の後退や反復は新しいグループに分け、変数の最初と最後の値を保持します。
+途中の値は省略しますが、元の `states` から取得できます。実行中の末尾グループは位置変更または終了時に公開します。
+
+`source_variables` の `mapping_ids` は `mapping_definitions` の完全な定義を順番通りに参照します。
+`source_steps` の `kind="auxiliary"` は変数変更もイベントフラグもない連続した正確な `nop;` を表し、範囲と件数を保持します。
 
 ### パイプライン状態の取得
 

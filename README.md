@@ -73,6 +73,7 @@ Claude Desktop：在 `claude_desktop_config.json` 中添加；Claude Code：在 
 | `get_draw_call_details` | 获取指定绘制调用的详细信息 |
 | `get_action_timings` | 获取可用的 GPU 动作耗时 |
 | `get_shader_info` | 获取着色器反汇编、调试信息中的源码及常量缓冲区值 |
+| `export_shader_mapped_source` | 导出保留 DXIL 指令映射到的源码行 |
 | `debug_vertex` / `debug_pixel` | 异步启动顶点或像素着色器调试 |
 | `get_debug_trace` / `release_debug_trace` | 分页读取 / 释放调试轨迹 |
 | `get_buffer_contents` | 获取缓冲区内容（Base64） |
@@ -102,6 +103,22 @@ get_shader_info(event_id=123, stage="pixel")
 
 对于 UE5 等使用外部 shader 调试文件的场景，请在 RenderDoc 的 Settings > Core > Shader Debug Search Path 中添加目录。如果打开捕获文件后才修改设置，请按 RenderDoc 提示重新加载 shader 调试信息，或重新打开捕获文件。若对应 shader 调试文件不含源码，即使有反汇编也无法获取源码；普通应用程序 PDB 或源码目录本身并不够。
 
+### 导出编译后指令对应的源码
+
+```python
+export_shader_mapped_source(
+    event_id=7279,
+    stage="pixel",
+    output_path="D:\\out\\mapped_source.hlsl",
+)
+```
+
+该工具使用 `DXC DXIL` 反汇编中的调试位置，只导出保留指令关联的源码行，不运行像素或顶点调试。它包含编译后保留的运行时分支，不是单个像素的执行路径。文件使用 `#line` 保留原始文件名和行号，用于阅读；缺少映射的声明、宏和依赖可能被省略，因此不保证可重新编译。
+
+目前支持 DXIL 且要求 RenderDoc 提供 `DXC DXIL` 目标及匹配的源码调试信息；映射不可用时明确报错。没有行号映射并不能证明源码被优化删除。输出路径必须是绝对 `.hlsl` 路径、父目录存在，已有文件不会覆盖。
+
+RenderDoc 的反汇编可能来自 ILDB 调试字节码，因此结果是指令关联的源码摘录，不是驱动最终机器码或源码优化覆盖率的证明。
+
 ### 顶点和像素着色器调试
 
 ```python
@@ -111,6 +128,7 @@ debug_pixel(event_id=11824, x=620, y=208, primitive=0)
 # 使用返回的 trace_id
 get_debug_trace(trace_id="...", section="status")
 get_debug_trace(trace_id="...", section="metadata")
+get_debug_trace(trace_id="...", section="source_steps", offset=0, limit=50)
 get_debug_trace(trace_id="...", section="states", offset=0, limit=50)
 get_debug_trace(trace_id="...", section="instructions", offset=0, limit=50)
 get_debug_trace(trace_id="...", section="sources")
@@ -119,11 +137,19 @@ release_debug_trace(trace_id="...")
 
 启动后查询 `status`，直到状态为 `complete`、`failed` 或 `cancelled`。`states`、`instructions` 和 `sources` 可通过 `next_offset` 继续分页读取。每个步骤的 `changes` 表示进入该状态时的变化，`next_instruction` 是下一条将执行的指令；指令编号不一定连续，指令信息稀疏时会使用前一个编号。为保持精度，64 位整数和 GPU 指针以十进制字符串返回；非有限浮点数返回为 `NaN`、`Infinity` 或 `-Infinity` 字符串。
 
+调试轨迹内部保存变量首次出现时的基线及后续成员增量。`states` 按需返回重建后的原始状态，`state_deltas` 返回紧凑有序流，记录数与 `states` 相同。增量流的 `version=1`，使用内联 `seed`/`create`、成员路径 `patch` 和 `unset`，调用栈通过 `callstack_id` 共享；必须从 offset 0 开始用 `shader_state_codec.StateDecoder` 顺序解码。变量基线可能在后续步骤才出现，不能视作所有局部变量在开始时都有值。`source_steps` 分组规则不变。
+
+`instructions` 和 `sources` 只包含所选执行对象已确认经过的调试步骤指令及其源码行，并非完整着色器。`sources` 返回去重后的文件索引、原始行号和文本；`instructions` 中的 `source_variables_id` 对应分页段 `source_variables` 的映射。稀疏映射使用 `mapping_instruction` 标明继承的映射锚点。源码可能不可用；失败或取消的任务只有部分结果。如需完整源码，请使用 `get_shader_info`。
+
 `vertex` 和 `instance` 是绘制调用内从零开始的编号。索引绘制会解析实际顶点索引，结果位于 `invocation.resolved_index`。像素的 `x`、`y` 是以左上角为原点的整数坐标。同一像素被多个图元覆盖时可指定 `primitive`，使用 MSAA 时可指定 `sample`。RenderDoc 不支持直接指定 fragment index；找不到指定图元时可能选择其他 fragment。选择精度重要时，请使用 RenderDoc 的 Pixel History 核对。
 
 轨迹是 RenderDoc 为选定执行对象生成的调试结果；源码和变量名依赖 shader 调试信息，不包含所有 GPU lane 或资源的全部内容。一次只能运行一个调试任务。`release_debug_trace` 可请求取消，但可能需要等待当前 RenderDoc 原生操作返回。轨迹总存储限额为 256 MiB，超限时状态为 `failed`，部分结果会保留；请释放不再需要的轨迹。RenderDoc 单次返回的执行批次大小不受该限制。轨迹仅保存在扩展中，扩展重新加载或结束时会消失。
 
 同时使用多个 MCP 服务进程时，应为每个进程及其对应 RenderDoc 设置相同的 `RENDERDOC_MCP_IPC_DIR`，并使用不同目录隔离各组进程。
+
+`source_steps` 按连续源码位置和调用栈聚合已确认的执行步骤，指令回退或重复会开始新组。每组保留起止步骤、标志及变量首末值，省略组内中间值；原始 `states` 仍可查询。正在运行的最后一组在结束或位置变化时才发布，因此分页只返回已完成组。
+
+`source_variables` 的每个快照保存有序 `mapping_ids`，通过 `mapping_definitions` 的 `id` 查询完整定义，重复引用和顺序均保留。`source_steps` 中 `kind="auxiliary"` 表示连续、无变量变化且无事件标志的精确 `nop;` 辅助步骤；其步骤范围和数量保留，源码位置不作为有效计算展示。
 
 ### 获取贴图数据与视图
 
